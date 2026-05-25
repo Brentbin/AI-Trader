@@ -15,15 +15,12 @@ from typing import Optional, Dict, Tuple, Any
 import re
 import time
 import json
+import yfinance as yf
 try:
     from zoneinfo import ZoneInfo
     _ET_ZONEINFO = ZoneInfo("America/New_York")
 except ImportError:
     _ET_ZONEINFO = None  # Python < 3.9 fallback: use fixed offset below
-
-# Alpha Vantage API configuration
-ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY", "demo")
-BASE_URL = "https://www.alphavantage.co/query"
 
 # Hyperliquid public info endpoint (no API key required for reads)
 HYPERLIQUID_API_URL = os.environ.get("HYPERLIQUID_API_URL", "https://api.hyperliquid.xyz/info").strip()
@@ -700,9 +697,6 @@ def get_price_from_market(
             # We use the current orderbook mid price (paper trading).
             price = _get_polymarket_mid_price(symbol, token_id=token_id, outcome=outcome)
         elif market == "us-stock":
-            if not ALPHA_VANTAGE_API_KEY or ALPHA_VANTAGE_API_KEY == "demo":
-                _price_log("Warning: ALPHA_VANTAGE_API_KEY not set, using agent-provided price")
-                return None
             price = _get_us_stock_price(symbol, executed_at)
         else:
             _price_log(f"[Price API] Unsupported market for server price fetch: {market}")
@@ -720,80 +714,50 @@ def get_price_from_market(
 
 
 def _get_us_stock_price(symbol: str, executed_at: str) -> Optional[float]:
-    """获取美股价格"""
-    # Alpha Vantage TIME_SERIES_INTRADAY 返回美国东部时间 (ET)
+    """Fetch a US stock price at-or-before executed_at via yfinance.
+
+    Strategy: pull 1-min bars from the day of execution (yfinance keeps ~7 days
+    of intraday). Match the exact minute; otherwise the closest prior bar. If
+    intraday data is unavailable (older trade, weekend, missing ticker), fall
+    back to the most recent daily close.
+    """
     try:
-        # 先解析为 UTC
         dt_utc = datetime.fromisoformat(executed_at.replace('Z', '')).replace(tzinfo=UTC)
-        # 转换为东部时间 (ET)
-        dt_et = dt_utc.astimezone(ET_TZ)
     except ValueError:
         return None
 
-    month = dt_et.strftime("%Y-%m")
+    try:
+        ticker = yf.Ticker(symbol)
+        day_start = dt_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        intraday = ticker.history(start=day_start, end=day_end, interval="1m", auto_adjust=False)
+    except Exception as e:
+        _price_log(f"[Price API] yfinance intraday error for {symbol}: {e}")
+        intraday = None
 
-    params = {
-        "function": "TIME_SERIES_INTRADAY",
-        "symbol": symbol,
-        "interval": "1min",
-        "month": month,
-        "outputsize": "compact",
-        "entitlement": "realtime",
-        "apikey": ALPHA_VANTAGE_API_KEY
-    }
+    if intraday is not None and not intraday.empty:
+        idx_utc = intraday.index.tz_convert("UTC") if intraday.index.tz is not None else intraday.index.tz_localize("UTC")
+        prior = [(i, ts) for i, ts in enumerate(idx_utc) if ts.to_pydatetime() <= dt_utc]
+        if prior:
+            i, ts = prior[-1]
+            try:
+                close = float(intraday["Close"].iloc[i])
+                diff_sec = int((dt_utc - ts.to_pydatetime()).total_seconds())
+                _price_log(f"[Price API] {symbol} ${close} ({diff_sec}s before exec)")
+                return close
+            except (TypeError, ValueError):
+                pass
 
     try:
-        data = _request_json_with_retry(
-            "alphavantage",
-            "GET",
-            BASE_URL,
-            params=params,
-        )
-
-        if "Error Message" in data:
-            _price_log(f"[Price API] Error: {data.get('Error Message')}")
-            return None
-        if "Note" in data:
-            _activate_provider_cooldown(
-                "alphavantage",
-                PRICE_FETCH_RATE_LIMIT_COOLDOWN_SECONDS,
-                "body rate limit note"
-            )
-            _price_log(f"[Price API] Rate limit: {data.get('Note')}")
-            return None
-
-        time_series_key = "Time Series (1min)"
-        if time_series_key not in data:
-            _price_log(f"[Price API] No time series data for {symbol}")
-            return None
-
-        time_series = data[time_series_key]
-        # 使用东部时间进行比较
-        target_datetime = dt_et.strftime("%Y-%m-%d %H:%M:%S")
-
-        # 精确匹配
-        if target_datetime in time_series:
-            return float(time_series[target_datetime].get("4. close", 0))
-
-        # 找最接近的之前的数据
-        min_diff = float('inf')
-        closest_price = None
-
-        for time_key, values in time_series.items():
-            time_dt = datetime.strptime(time_key, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ET_TZ)
-            if time_dt <= dt_et:
-                diff = (dt_et - time_dt).total_seconds()
-                if diff < min_diff:
-                    min_diff = diff
-                    closest_price = float(values.get("4. close", 0))
-
-        if closest_price:
-            _price_log(f"[Price API] Found closest price for {symbol}: ${closest_price} ({int(min_diff)}s earlier)")
-        return closest_price
-
+        daily = yf.Ticker(symbol).history(period="5d", auto_adjust=False)
+        if daily is not None and not daily.empty:
+            close = float(daily["Close"].iloc[-1])
+            _price_log(f"[Price API] {symbol} fallback to last daily close ${close}")
+            return close
     except Exception as e:
-        _price_log(f"[Price API] Exception while fetching {symbol}: {e}")
-        return None
+        _price_log(f"[Price API] yfinance daily fallback error for {symbol}: {e}")
+
+    return None
 
 
 def _get_crypto_price(symbol: str, executed_at: str) -> Optional[float]:

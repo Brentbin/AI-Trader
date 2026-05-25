@@ -19,6 +19,7 @@ from typing import Any, Optional
 import re
 
 import requests
+import yfinance as yf
 try:
     from openrouter import OpenRouter
 except ImportError:  # pragma: no cover - optional dependency in some environments
@@ -29,10 +30,9 @@ except ImportError:  # pragma: no cover - Python < 3.9 fallback
     ZoneInfo = None
 
 from cache import delete_pattern, get_json, set_json
-from config import ADANOS_API_BASE_URL, ADANOS_API_KEY, ALPHA_VANTAGE_API_KEY
+from config import ADANOS_API_BASE_URL, ADANOS_API_KEY
 from database import get_db_connection
 
-ALPHA_VANTAGE_BASE_URL = os.getenv("ALPHA_VANTAGE_BASE_URL", "https://www.alphavantage.co/query").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "").strip()
 MARKET_NEWS_LOOKBACK_HOURS = int(os.getenv("MARKET_NEWS_LOOKBACK_HOURS", "48"))
@@ -167,16 +167,6 @@ def _datetime_to_iso_z(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _parse_alpha_intraday_timestamp(raw: Optional[str]) -> Optional[str]:
-    if not raw or not isinstance(raw, str):
-        return None
-    try:
-        parsed = datetime.strptime(raw.strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=US_EASTERN_TZ)
-    except ValueError:
-        return None
-    return _datetime_to_iso_z(parsed)
-
-
 def _daily_close_as_of_iso(raw_date: Optional[str]) -> Optional[str]:
     if not raw_date or not isinstance(raw_date, str):
         return None
@@ -247,47 +237,30 @@ def _stock_quote_cache_set(symbol: str, payload: dict[str, Any], ttl_seconds: in
     set_json(_cache_key("stocks", "quote_v1", symbol), payload, ttl_seconds=ttl_seconds)
 
 
-def _extract_intraday_quote(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
-    meta = payload.get("Meta Data") if isinstance(payload, dict) else None
-    time_series = payload.get("Time Series (1min)") if isinstance(payload, dict) else None
-    if not isinstance(time_series, dict) or not time_series:
-        return None
-
-    last_refreshed = meta.get("3. Last Refreshed") if isinstance(meta, dict) else None
-    if not isinstance(last_refreshed, str) or last_refreshed not in time_series:
-        last_refreshed = max(time_series.keys())
-    values = time_series.get(last_refreshed)
-    if not isinstance(values, dict):
-        return None
-
+def _fetch_stock_quote_payload(symbol: str) -> Optional[dict[str, Any]]:
     try:
-        current_price = float(values.get("4. close") or values.get("1. open"))
+        hist = yf.Ticker(symbol).history(period="1d", interval="1m", auto_adjust=False)
+    except Exception:
+        return None
+    if hist is None or hist.empty:
+        return None
+    last_idx = hist.index[-1]
+    try:
+        close = float(hist["Close"].iloc[-1])
     except (TypeError, ValueError):
         return None
-
-    price_as_of = _parse_alpha_intraday_timestamp(last_refreshed)
-    if not price_as_of:
-        return None
-
+    if hasattr(last_idx, "tz_convert") and last_idx.tzinfo is not None:
+        last_utc = last_idx.tz_convert("UTC")
+    elif hasattr(last_idx, "tz_localize") and last_idx.tzinfo is None:
+        last_utc = last_idx.tz_localize("UTC")
+    else:
+        last_utc = last_idx
     return {
         "available": True,
-        "current_price": round(current_price, 2),
-        "price_as_of": price_as_of,
-        "price_source": "alpha_vantage_time_series_intraday",
+        "current_price": round(close, 2),
+        "price_as_of": last_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "price_source": "yfinance_intraday_1m",
     }
-
-
-def _fetch_stock_quote_payload(symbol: str) -> Optional[dict[str, Any]]:
-    if not ALPHA_VANTAGE_API_KEY or ALPHA_VANTAGE_API_KEY == "demo":
-        return None
-    payload = _alpha_vantage_get({
-        "function": "TIME_SERIES_INTRADAY",
-        "symbol": symbol,
-        "interval": "1min",
-        "outputsize": "compact",
-        "entitlement": "realtime",
-    })
-    return _extract_intraday_quote(payload)
 
 
 def _get_stock_quote_payload(symbol: str) -> Optional[dict[str, Any]]:
@@ -325,7 +298,7 @@ def _build_stock_price_metadata(price_as_of: Optional[str], price_source: Option
     stale = True
     status = "stale"
 
-    if price_source == "alpha_vantage_time_series_intraday":
+    if price_source == "yfinance_intraday_1m":
         market_open = _is_us_market_open(now_utc)
         quote_et = parsed_as_of.astimezone(US_EASTERN_TZ)
         now_et = now_utc.astimezone(US_EASTERN_TZ)
@@ -363,7 +336,7 @@ def _decorate_stock_analysis_with_quote(base_payload: dict[str, Any]) -> dict[st
     fallback_quote = {
         "current_price": payload.get("current_price"),
         "price_as_of": fallback_price_as_of,
-        "price_source": "alpha_vantage_time_series_daily_adjusted",
+        "price_source": "yfinance_daily_adjusted",
     }
     quote_payload = _get_stock_quote_payload(payload["symbol"]) or fallback_quote
     payload["current_price"] = quote_payload.get("current_price")
@@ -451,23 +424,6 @@ def _parse_alpha_timestamp(raw: Optional[str]) -> Optional[str]:
         except ValueError:
             continue
     return None
-
-
-def _alpha_vantage_get(params: dict[str, Any]) -> dict[str, Any]:
-    if not ALPHA_VANTAGE_API_KEY or ALPHA_VANTAGE_API_KEY == "demo":
-        raise RuntimeError("ALPHA_VANTAGE_API_KEY is not configured")
-    response = requests.get(
-        ALPHA_VANTAGE_BASE_URL,
-        params={**params, "apikey": ALPHA_VANTAGE_API_KEY},
-        timeout=20,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if isinstance(payload, dict):
-        error_message = payload.get("Error Message") or payload.get("Information") or payload.get("Note")
-        if error_message:
-            raise RuntimeError(str(error_message))
-    return payload
 
 
 def _extract_openrouter_text(response: Any) -> str:
@@ -668,59 +624,103 @@ def _build_news_summary(category: str, items: list[dict[str, Any]]) -> dict[str,
     }
 
 
+_YF_NEWS_PROXY_TICKERS: dict[str, list[str]] = {
+    "equities": ["SPY", "QQQ"],
+    "macro": ["^GSPC", "^TNX"],
+    "crypto": ["BTC-USD", "ETH-USD"],
+    "commodities": ["XLE", "USO"],
+}
+
+
+def _yf_news_item_to_av_shape(yf_item: dict[str, Any], category: str) -> Optional[dict[str, Any]]:
+    content = yf_item.get("content") if isinstance(yf_item, dict) else None
+    if not isinstance(content, dict):
+        return None
+    title = (content.get("title") or "").strip()
+    if not title:
+        return None
+    pub_date = content.get("pubDate") or content.get("displayTime")
+    if not isinstance(pub_date, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    time_published = dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    canonical = content.get("canonicalUrl") or {}
+    url = canonical.get("url") if isinstance(canonical, dict) else ""
+    if not url:
+        click = content.get("clickThroughUrl") or {}
+        url = click.get("url") if isinstance(click, dict) else ""
+    provider = content.get("provider") or {}
+    source = provider.get("displayName") if isinstance(provider, dict) else "Yahoo Finance"
+    summary = (content.get("summary") or content.get("description") or "").strip()
+    return {
+        "title": title,
+        "url": url or "",
+        "source": source or "Yahoo Finance",
+        "summary": summary,
+        "banner_image": None,
+        "time_published": time_published,
+        "overall_sentiment_score": 0.0,
+        "overall_sentiment_label": "Neutral",
+        "ticker_sentiment": [],
+        "topics": [{"topic": category, "relevance_score": 1.0}],
+    }
+
+
 def _fetch_news_feed(category: str, definition: dict[str, str]) -> list[dict[str, Any]]:
     now = _utc_now()
-    time_from = (now - timedelta(hours=MARKET_NEWS_LOOKBACK_HOURS)).strftime("%Y%m%dT%H%M")
-    params: dict[str, Any] = {
-        "function": "NEWS_SENTIMENT",
-        "sort": "LATEST",
-        "limit": MARKET_NEWS_CATEGORY_LIMIT,
-        "time_from": time_from,
-    }
-    if definition.get("topics"):
-        params["topics"] = definition["topics"]
-    if definition.get("tickers"):
-        params["tickers"] = definition["tickers"]
+    cutoff = now - timedelta(hours=MARKET_NEWS_LOOKBACK_HOURS)
+    proxy_tickers = _YF_NEWS_PROXY_TICKERS.get(category, ["SPY"])
 
-    payload = _alpha_vantage_get(params)
-    feed = payload.get("feed") if isinstance(payload, dict) else None
-    if not isinstance(feed, list):
-        return []
+    raw_items: list[dict[str, Any]] = []
+    for ticker in proxy_tickers:
+        try:
+            items = yf.Ticker(ticker).news or []
+        except Exception:
+            continue
+        for item in items:
+            shaped = _yf_news_item_to_av_shape(item, category)
+            if shaped is None:
+                continue
+            try:
+                dt = datetime.strptime(shaped["time_published"], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if dt < cutoff:
+                continue
+            raw_items.append(shaped)
 
     normalized_items = []
-    for item in feed:
-        if not isinstance(item, dict):
-            continue
+    for item in raw_items:
         normalized = _normalize_news_item(item)
         if normalized:
             normalized_items.append(normalized)
+        if len(normalized_items) >= MARKET_NEWS_CATEGORY_LIMIT:
+            break
     return _dedupe_news_items(normalized_items)
 
 
 def _fetch_daily_adjusted_series(symbol: str) -> list[dict[str, Any]]:
-    payload = _alpha_vantage_get({
-        "function": "TIME_SERIES_DAILY_ADJUSTED",
-        "symbol": symbol,
-        "outputsize": "compact",
-    })
-    series = payload.get("Time Series (Daily)") if isinstance(payload, dict) else None
-    if not isinstance(series, dict):
-        raise RuntimeError(f"Missing daily series for {symbol}")
-
+    try:
+        hist = yf.Ticker(symbol).history(period="3mo", auto_adjust=True)
+    except Exception:
+        return []
+    if hist is None or hist.empty:
+        return []
     rows: list[dict[str, Any]] = []
-    for date_str, values in series.items():
-        if not isinstance(values, dict):
-            continue
+    for idx, row in hist.iterrows():
         try:
-            close_value = float(values.get("5. adjusted close") or values.get("4. close"))
+            close_value = float(row["Close"])
         except (TypeError, ValueError):
             continue
         try:
-            volume_value = float(values.get("6. volume") or 0)
+            volume_value = float(row.get("Volume") or 0)
         except (TypeError, ValueError):
             volume_value = 0.0
         rows.append({
-            "date": date_str,
+            "date": idx.strftime("%Y-%m-%d"),
             "close": close_value,
             "volume": volume_value,
         })
@@ -729,37 +729,20 @@ def _fetch_daily_adjusted_series(symbol: str) -> list[dict[str, Any]]:
 
 
 def _fetch_btc_daily_series() -> list[dict[str, Any]]:
-    payload = _alpha_vantage_get({
-        "function": "DIGITAL_CURRENCY_DAILY",
-        "symbol": "BTC",
-        "market": "USD",
-    })
-    series = payload.get("Time Series (Digital Currency Daily)") if isinstance(payload, dict) else None
-    if not isinstance(series, dict):
-        raise RuntimeError("Missing BTC daily series")
-
+    try:
+        hist = yf.Ticker("BTC-USD").history(period="3mo", auto_adjust=True)
+    except Exception:
+        return []
+    if hist is None or hist.empty:
+        return []
     rows: list[dict[str, Any]] = []
-    for date_str, values in series.items():
-        if not isinstance(values, dict):
-            continue
-        close_value = None
-        for key in (
-            "4b. close (USD)",
-            "4a. close (USD)",
-            "4. close",
-        ):
-            try:
-                candidate = values.get(key)
-                if candidate is None:
-                    continue
-                close_value = float(candidate)
-                break
-            except (TypeError, ValueError):
-                continue
-        if close_value is None:
+    for idx, row in hist.iterrows():
+        try:
+            close_value = float(row["Close"])
+        except (TypeError, ValueError):
             continue
         rows.append({
-            "date": date_str,
+            "date": idx.strftime("%Y-%m-%d"),
             "close": close_value,
         })
     rows.sort(key=lambda row: row["date"], reverse=True)
@@ -1255,10 +1238,7 @@ def _build_macro_signals() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     }
 
     source = {
-        "alpha_vantage_functions": [
-            "TIME_SERIES_DAILY_ADJUSTED",
-            "DIGITAL_CURRENCY_DAILY",
-        ],
+        "yfinance_tickers": list(MACRO_SYMBOLS.values()) + ["BTC-USD"],
         "news_dependency": "market_news_snapshots.macro",
     }
 
